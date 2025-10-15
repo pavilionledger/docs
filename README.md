@@ -1,43 +1,63 @@
-# Mintlify Starter Kit
+## System Architecture
 
-Use the starter kit to get your docs deployed and ready to customize.
+```mermaid
+sequenceDiagram
+    autonumber
 
-Click the green **Use this template** button at the top of this repo to copy the Mintlify starter kit. The starter kit contains examples with
+    %% ================== LANE: EDGE ==================
+    box "Edge / Clients"
+      participant U as Wallet / DApp
+      participant IDX as App Indexer
+    end
 
-- Guide pages
-- Navigation
-- Customizations
-- API reference pages
-- Use of popular components
+    %% ================== LANE: COWBOY CHAIN ==================
+    box "Cowboy Chain"
+      participant RPC as RPC
+      participant NET as Network & Mempool
+      participant CONS as Consensus
+      participant ACT as Actor VM
+      participant SYS as System Contracts
+      participant SCH as Timer Scheduler CIP-1
+      participant FEE as Dual-Metered Gas
+      participant STO as Storage
+    end
 
-**[Follow the full quickstart guide](https://starter.mintlify.com/quickstart)**
+    %% ================== LANE: OFF-CHAIN ==================
+    box "Off-Chain Compute"
+      participant VRF as VRF Seed
+      participant RUN as Runners
+      participant BLOB as Artifact Store
+    end
 
-## Development
+    %% ================== MAIN FLOW ==================
+    U ->> RPC: state query
+    RPC -->> U: events / state
 
-Install the [Mintlify CLI](https://www.npmjs.com/package/mint) to preview your documentation changes locally. To install, use the following command:
+    U ->> NET: signed tx
+    NET ->> FEE: inclusion & pricing
+    NET ->> CONS: propose / vote
+    CONS ->> STO: finalize block
+
+    CONS ->> ACT: deliver tx for execution
+    ACT ->> STO: deterministic state writes
+
+    %% ---- Off-chain task path (CIP-2, summarized) ----
+    ACT ->> SYS: submit task + escrow
+    SYS ->> VRF: request selection seed
+    VRF -->> SYS: seed from last QC
+    SYS ->> RUN: assign task
+    RUN ->> BLOB: read / write artifacts
+    RUN ->> SYS: submit result
+    SYS ->> SCH: defer callback
+    SCH ->> ACT: on_result callback
+    ACT ->> STO: apply result state
+
+    %% ---- Scheduled / timed path (CIP-1, summarized) ----
+    SCH ->> ACT: scheduled call (timer)
+    ACT ->> STO: state update
+
+    %% ---- Observability back to edge ----
+    STO -->> IDX: block / state stream
+    IDX -->> U: indexed views
 
 ```
-npm i -g mint
-```
-
-Run the following command at the root of your documentation, where your `docs.json` is located:
-
-```
-mint dev
-```
-
-View your local preview at `http://localhost:3000`.
-
-## Publishing changes
-
-Install our GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app) to propagate changes from your repo to your deployment. Changes are deployed to production automatically after pushing to the default branch.
-
-## Need help?
-
-### Troubleshooting
-
-- If your dev environment isn't running: Run `mint update` to ensure you have the most recent version of the CLI.
-- If a page loads as a 404: Make sure you are running in a folder with a valid `docs.json`.
-
-### Resources
-- [Mintlify documentation](https://mintlify.com/docs)
