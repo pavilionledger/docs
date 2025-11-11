@@ -13,130 +13,85 @@
 
 ```mermaid
 flowchart LR
-  %% 布局从左到右
-  %% 说明：节点文字尽量精简；保持与文档一致（EOB-1..6，Timer 判定/物化/执行）
-  
-  %% ─────────────────────────────
+  %% Layout
+  %% Keep labels ASCII-only and use <br/> line breaks.
+
   %% 1) Execution Engine
-  %% ─────────────────────────────
   subgraph A[Execution Engine]
-    TX[Tx 执行 @h
-→ 生成 ModifiedKeySet(h)
-→ 生成 ExecutedTxLog(h)]
+    TX[Tx @ h<br/>Produces ModifiedKeySet(h)<br/>Produces ExecutedTxLog(h)]
   end
 
-  %% ─────────────────────────────
   %% 2) Timers (CIP-5)
-  %% ─────────────────────────────
-  subgraph B[Timers（CIP-5）]
-    T0[登记/更新/取消
-（本块不执行）]
-    T1[EOB-1 DeliverTimers（判定+排序）
-候选=IndexHeight.le(h) ∪ (IndexWatch ∩ ModifiedSet)
-去重→评分(老化/出价/FIFO)
-per-target 轮转+配额剪枝
-Materialize→Mailbox
-deliver_id=H(h,parent_root,timer_id,seq)]
-    T5[EOB-5 SystemHooks（批量写回）
-周期/间隔型 Timer 下一次 due_height]
+  subgraph B[Timers (CIP-5)]
+    T0[Register/Update/Cancel<br/>(no firing in same block)]
+    T1[EOB-1 DeliverTimers<br/>Candidates = IndexHeight <= h<br/>& IndexWatch & ModifiedSet<br/>Dedup -> Score(age/bid/FIFO)<br/>Per-target RR + quotas<br/>Materialize to Mailbox<br/>deliver_id = H(h,parent_root,timer_id,seq)]
+    T5[EOB-5 SystemHooks<br/>Batch write next due_height<br/>for interval/periodic timers]
   end
 
-  %% ─────────────────────────────
-  %% 3) EOB（控制面）
-  %% ─────────────────────────────
-  subgraph C[EOB（控制面，固定顺序）]
-    E1[EOB-1 DeliverTimers
-调用 CIP-5 deliver()]
-    E2[EOB-2 ResolveOffchain
-合规 Runner 回调→Mailbox]
-    E3[EOB-3 ExecuteMailbox
-全序：phase→priority→RR→id
-执行（失败亦计费）]
-    E4[EOB-4 Fees & Burn
-聚合 Cycles/Cells
-调整双基费/结算]
-    E5[EOB-5 SystemHooks
-归档/索引/VRF/治理生效]
-    E6[EOB-6 Commit
-原子提交：STATE/RECEIPTS/
-MAILBOX(segment)/METERS/
-BLOCKMETA/state_root(h)]
+  %% 3) EOB (control plane)
+  subgraph C[EOB (control plane, fixed order)]
+    E1[EOB-1 DeliverTimers<br/>call CIP-5 deliver()]
+    E2[EOB-2 ResolveOffchain<br/>Valid runner callbacks -> Mailbox]
+    E3[EOB-3 ExecuteMailbox<br/>Total order: phase->priority->RR->id<br/>Exec (failures billed)]
+    E4[EOB-4 Fees & Burn<br/>Aggregate Cycles/Cells<br/>Adjust basefees/settle]
+    E5[EOB-5 SystemHooks<br/>Archive/Index/VRF/Gov apply]
+    E6[EOB-6 Commit<br/>Atomic commit: STATE/RECEIPTS/<br/>MAILBOX(segment)/METERS/<br/>BLOCKMETA/state_root(h)]
   end
 
-  %% ─────────────────────────────
   %% 4) Messaging / Mailbox
-  %% ─────────────────────────────
   subgraph D[Messaging / Mailbox]
-    M1[物化 MailboxEntry
-（来自 Timers）]
-    M2[物化 MailboxEntry
-（来自 Offchain）]
-    M3[维持全序
-phase→priority→RR→deliver_id]
-    M6[Mailbox 段持久化]
+    M1[Materialize MailboxEntry<br/>(from Timers)]
+    M2[Materialize MailboxEntry<br/>(from Offchain)]
+    M3[Maintain total order<br/>phase->priority->RR->deliver_id]
+    M6[Mailbox segment persisted]
   end
 
-  %% ─────────────────────────────
-  %% 5) VM（PyVM/EVM）
-  %% ─────────────────────────────
-  subgraph E[VM（PyVM/EVM）]
-    V3[执行入箱条目
-调度 target actor
-写回状态]
+  %% 5) VM
+  subgraph E[VM (PyVM/EVM)]
+    V3[Run mailbox entries<br/>Schedule target actor<br/>Write state]
   end
 
-  %% ─────────────────────────────
   %% 6) State / Fees / BlockMeta
-  %% ─────────────────────────────
   subgraph F[State / Fees / BlockMeta]
-    S1[只读索引用于判定
-（不改状态）]
-    S2[只读 RunnerInbox 判定
-（不改状态）]
-    S3[写集：STATE 变更/
-RECEIPTS/METERS/LOGS]
-    S4[聚合用量与结算
-基费调整与燃烧/小费]
-    S5[批量系统级写
-（周期 Timer 下一次 due_height）]
-    S6[提交并计算
-state_root(h)]
+    S1[Read-only indexes for EOB-1]
+    S2[Read-only runner inbox for EOB-2]
+    S3[Writes: STATE changes,<br/>RECEIPTS/METERS/LOGS]
+    S4[Usage aggregation & settlement<br/>Basefee adjust & burn/tips]
+    S5[Batch system writes<br/>(next due_height for intervals)]
+    S6[Commit & compute state_root(h)]
   end
 
-  %% ─────────────────────────────
-  %% 阶段内外数据流（跨泳道连线）
-  %% ─────────────────────────────
+  %% Cross-lane flows
   TX --> T0
   TX --> E1
 
-  %% EOB-1：从 Timers 判定并物化至 Mailbox
+  %% EOB-1: timers -> mailbox
   E1 --> T1 --> M1
 
-  %% EOB-2：合规的 Offchain 回调物化至 Mailbox
+  %% EOB-2: offchain -> mailbox
   E2 --> M2
 
-  %% 执行前总序维护
+  %% Merge and order before execute
   M1 --> M3
   M2 --> M3
 
-  %% EOB-3：执行入箱条目
+  %% EOB-3 execute
   M3 --> E3 --> V3 --> S3
 
-  %% EOB-4：费用与基费
+  %% EOB-4 fees
   E4 --> S4
 
-  %% EOB-5：系统钩子与周期 Timer 写回
+  %% EOB-5 hooks
   E5 --> T5
   E5 --> S5
 
-  %% EOB-6：原子提交（Mailbox 段与状态）
+  %% EOB-6 commit
   E6 --> M6
   E6 --> S6
 
-  %% 辅助虚线：判定期仅读
-  S1 -. 只读 .-> E1
-  S2 -. 只读 .-> E2
-
+  %% Read-only cues (dotted)
+  S1 -. read-only .-> E1
+  S2 -. read-only .-> E2
 ```
 
 ## 1. 摘要（Abstract）
