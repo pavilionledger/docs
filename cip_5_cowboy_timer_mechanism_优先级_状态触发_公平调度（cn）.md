@@ -10,6 +10,27 @@
 
 ---
 
++------------------------------------------------------------------------------------------------------+
+|                                         CIP-5 Timer Mechanism                                        |
++--------------------+-------------------------+----------------------------+--------------------------+
+|   Index (只读)      |   Candidate Build       |   Fair Selection & Quotas  |   Materialize to Mailbox |
++--------------------+-------------------------+----------------------------+--------------------------+
+| IndexHeight        | 输入：                   | 全局排序键（CIP-5）：          | 生成 MailboxEntry:       |
+|  - (due_height →   |  - 来自 IndexHeight      |  - score := f(W_age,       |  - deliver_id :=         |
+|     timer_ids)     |    & IndexWatch 的      |            W_bid, W_fifo)  |    H(h, parent_state_    |
+|                    |    “到期/命中”timer      |  - 决胜序：score →           |    root, timer_id,       |
+| IndexWatch         | 过程：                   |          per-target RR →   |    fire_seq)             |
+|  - (watch_pred →   |  1) 构造候选集 C         |          FIFO(同分)         |  - snapshot: payload_    |
+|     timer_ids)     |  2) 计算 score          | 配额与限流：                 |    snapshot, gas_limit_  |
+|                    |  3) 应用配额/公平性       |  - MAX_FIRES_PER_BLOCK     |    snapshot, bid_        |
+| （无 IndexTime）    |     规则                |  - MAX_FIRES_PER_TARGET    |    snapshot, trigger_ctx |
+|                    | 输出：候选的有序视图       |  - MIN_GAS_LIMIT_PER_TIMER | 源标注：source=Timer      |
++--------------------+-------------------------+----------------------------+--------------------------+
+                           ^                           |                                 |
+                           |（只读快照，禁止本地时钟）      |（确定性比较，禁浮点/随机）          |（仅“入箱”——到此为止） 
+                           +---------------------------+---------------------------------+  
+
+
 ## 1. 摘要（Abstract）
 
 本提案定义 Cowboy 协议中的 **原生 Timer 机制**：在不依赖外部 keeper 网络的前提下，为合约/Actor 提供**按区块高度**与**按状态变更**两类触发能力，并在**区块末（EOB）**以确定、可重演的方式筛选、物化并投递到各 Actor 的 **Mailbox**。
