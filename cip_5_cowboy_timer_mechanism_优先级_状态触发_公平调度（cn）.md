@@ -15,58 +15,72 @@
 sequenceDiagram
     autonumber
     participant EXE as Execution Engine
-    participant TIM as Timers (CIP-5)
-    participant EOB as EOB (control)
-    participant MBX as Messaging/Mailbox
-    participant VM  as VM (PyVM/EVM)
-    participant ST  as State/Fees/BlockMeta
+    participant TIM as Timers CIP-5
+    participant EOB as EOB control
+    participant MBX as Mailbox
+    participant VM  as VM
+    participant ST  as State-Fees-Meta
 
-    %% --- Pre-EOB: execute tx in block h ---
-    EXE->>EXE: Run TX @ height h
-    EXE->>EXE: Build ModifiedKeySet(h), ExecutedTxLog(h)
+    %% Pre-EOB: execute tx in block h
+    EXE->>EXE: Run TX @ h
+    EXE->>EXE: Build ModifiedKeySet(h)
+    EXE->>EXE: Build ExecutedTxLog(h)
 
-    %% --- EOB-1: DeliverTimers (collect + order + materialize) ---
-    EXE->>EOB: Start EOB pipeline for block h
-    Note over EOB: EOB-1 DeliverTimers
-    EOB->>TIM: Call deliver() with h, parent_state_root,<br/>IndexHeight.le(h), IndexWatch ∩ ModifiedKeySet(h)
-    TIM->>TIM: Dedup -> Score(age/bid/FIFO) -> Per-target RR -> Quotas
-    TIM->>MBX: Materialize Timer entries (deliver_id = H(h,parent_root,timer_id,seq))
-    TIM-->>EOB: Candidate set materialized (Mailbox entries)
-
-    %% --- EOB-2: Resolve offchain callbacks ---
-    Note over EOB: EOB-2 ResolveOffchain
-    EOB->>ST: Read runner inbox (<= h, verified, no dispute)
-    EOB->>MBX: Materialize Offchain entries (same ordering rules)
-
-    %% --- EOB-3: Execute mailbox in total order ---
-    Note over EOB,MBX,VM: EOB-3 ExecuteMailbox
-    MBX->>MBX: Maintain total order: phase -> priority -> RR -> deliver_id
-    MBX->>VM: Dispatch next mailbox entry
-    VM->>ST: Apply writes (STATE/RECEIPTS/METERS/LOGS)
-    loop Until mailbox empty
-        MBX->>VM: Next entry (failures billed too)
-        VM->>ST: Write effects
+    %% EOB-1
+    rect
+      Note over EOB: EOB-1 DeliverTimers
+      EXE->>EOB: Start EOB for h
+      EOB->>TIM: deliver(h,parent_root,indexes,mods)
+      TIM->>TIM: Dedup score RR quotas
+      TIM->>MBX: Materialize timer entries (deliver_id)
+      TIM-->>EOB: Done
     end
 
-    %% --- EOB-4: Fees & Burn ---
-    Note over EOB,ST: EOB-4 Fees & Burn
-    EOB->>ST: Aggregate Cycles/Cells, adjust basefees, burn, tips
+    %% EOB-2
+    rect
+      Note over EOB: EOB-2 ResolveOffchain
+      EOB->>ST: Read runner inbox <= h
+      EOB->>MBX: Materialize offchain entries
+    end
 
-    %% --- EOB-5: System hooks & periodic timer roll-forward ---
-    Note over EOB,TIM,ST: EOB-5 SystemHooks
-    EOB->>TIM: Batch write next due_height for interval/periodic timers
-    EOB->>ST: Archive/Index/VRF/Gov apply (system-level)
+    %% EOB-3
+    rect
+      Note over EOB: EOB-3 ExecuteMailbox
+      MBX->>MBX: Total order phase>prio>RR>id
+      MBX->>VM: Dispatch next entry
+      VM->>ST: Apply writes
+      loop until mailbox empty
+        MBX->>VM: Next entry (fail ok billed)
+        VM->>ST: Write effects
+      end
+    end
 
-    %% --- EOB-6: Atomic commit ---
-    Note over EOB,ST,MBX: EOB-6 Commit
-    EOB->>ST: Commit STATE/RECEIPTS/METERS/BLOCKMETA, compute state_root(h)
-    EOB->>MBX: Persist mailbox segment for h
+    %% EOB-4
+    rect
+      Note over EOB: EOB-4 Fees-Burn
+      EOB->>ST: Aggregate usage
+      EOB->>ST: Adjust basefees burn tips
+    end
 
-    %% --- In-Block constraints / invariants ---
-    Note over TIM: New/updated/cancelled timers created in this block<br/>do NOT fire in the same block
-    Note over MBX: Materialization is idempotent via deliver_id
-    Note over EXE,ST: Deterministic inputs only (no local time/random)
+    %% EOB-5
+    rect
+      Note over EOB: EOB-5 SystemHooks
+      EOB->>TIM: Batch next due_height (interval)
+      EOB->>ST: Archive index vrf gov
+    end
 
+    %% EOB-6
+    rect
+      Note over EOB: EOB-6 Commit
+      EOB->>ST: Commit state receipts meters meta
+      EOB->>MBX: Persist mailbox segment
+      ST->>ST: Compute state_root(h)
+    end
+
+    %% In-block invariants
+    Note over TIM: New/updated/cancelled timers do not fire in same block
+    Note over MBX: Materialize is idempotent by deliver_id
+    Note over EXE: Deterministic only (no local time/random)
 ```
 
 ## 1. 摘要（Abstract）
