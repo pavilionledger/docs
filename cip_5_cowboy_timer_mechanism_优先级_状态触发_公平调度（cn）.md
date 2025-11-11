@@ -12,47 +12,60 @@
 
 
 ```mermaid
-sequenceDiagram
-    %% Lanes
-    participant EX as Execution Engine
-    participant EO as EOB (Control)
-    participant TB as Timers (CIP-5)
-    participant MS as Messaging
-    participant MB as Mailbox
-    participant VM as VM (PyVM/EVM)
+flowchart LR
+  %% CIP-5 Timer Mechanism — Swimlane-style via subgraphs
 
-    %% Tx execution phase (before EOB)
-    Note over EX: Tx Execution @ h →<br/>ModifiedKeySet(h), ExecutedTxLog(h)
+  subgraph L1[Execution]
+    E1[① 产生状态变更（可能触发 Watch 条件）<br/>※ 不使用本地时钟；以区块高度/状态为准]
+  end
 
-    %% EOB-1: DeliverTimers (Timer → Mailbox materialization)
-    EO->>TB: EOB-1 Deliver(h, parent_state_root,<br/>ModifiedKeySet(h))
-    Note over TB: Collect candidates:<br/>IndexHeight.le(h) ∪ (IndexWatch ∩ ModifiedKeySet)<br/>→ de-dup → score(aging/bid/FIFO)<br/>→ per-target RR + quotas
-    TB-->>MS: Build system message(s) for selected timers
-    MS-->>MB: Materialize as MailboxEntry<br/>(deliver_id = H(h, parent_state_root,<br/>timer_id, fire_seq))  %% 入箱幂等
+  subgraph L2[Timers.Index]
+    I1[② IndexHeight：登记/维护 due_height（周期性仅登记下一次）]
+    I2[② IndexWatch：登记满足状态条件的 Watch（match_set）]
+  end
 
-    %% EOB-2: ResolveOffchain (offchain callbacks → Mailbox)
-    EO->>MB: EOB-2 ResolveOffchain(h):<br/>materialize verified runner callbacks
+  subgraph L3[Timers.Deliver]
+    D1[③ 构造候选集：<br/>· IndexHeight 中 due_height ≤ h<br/>· IndexWatch 中在父状态满足条件]
+    D2[④ 计算候选优先级（priority）：<br/>priority_bucket、bid_snapshot、gas_limit_snapshot、trigger_ctx …<br/>※ 禁止使用 float/本地时间]
+    D3[⑤ 约束与公平性剪枝：<br/>· MAX_FIRES_PER_BLOCK / PER_TARGET<br/>· per-target RR（轮转）<br/>· MIN_GAS_LIMIT_PER_TIMER 等]
+    D4[⑥ 稳定排序（stable order）：<br/>priority_bucket → RR → FIFO（同桶）]
+  end
 
-    %% EOB-3: ExecuteMailbox (total order)
-    MB-->>VM: Dequeue next by total order:<br/>phase → priority_bucket → per-target RR → deliver_id
-    VM->>VM: Execute entry (target actor)<br/>→ write-set, meters, logs<br/>(failures still charged)
-    VM-->>EO: Return effects for aggregation
+  subgraph L4[Scheduler]
+    S1[⑦ 生成 deliver_id = H(h, parent_state_root, timer_id, fire_seq)]
+    S2[⑧ Materialize：产出 System message（source=Timer）]
+  end
 
-    %% EOB-4: Fees & Burn (dual-meter)
-    EO->>EO: EOB-4 Fees & Burn:<br/>aggregate Cycles/Cells usage,<br/>adjust base fees, burn basefee,<br/>tip to proposer
+  subgraph L5[Messaging]
+    M1[⑨ Enqueue：将 System message 写入目标 Actor 的 MAILBOX]
+    M2[（未入选候选保留在索引侧，等待后续区块）]
+  end
 
-    %% EOB-5: SystemHooks (system-only)
-    EO->>TB: EOB-5 SystemHooks:<br/>batch write next due_height for<br/>interval/periodic timers
-    EO->>EO: Other system hooks:<br/>index/metrics/VRF/governance, etc.
+  subgraph L6[Mailbox]
+    B1[⑩ MailboxSegment 可见（尚未执行，仅完成确定性注入）]
+  end
 
-    %% EOB-6: Commit (atomic)
-    EO->>MB: EOB-6 Commit:<br/>persist MAILBOX segment
-    EO->>EX: (state layer)
-    Note over EO: Atomic commit of<br/>STATE / RECEIPTS / MAILBOX(segment)<br/>/ METERS / BLOCKMETA / state_root(h)
+  subgraph L7["handoff to CIP-6 (EOB)"]
+    C1[⑪ EOB-3 ExecuteMailbox（按 CIP-6 比较器执行）]
+    C2[EOB-5 System hooks：批量写回周期 Timer 的下一次 due_height]
+    C3[EOB-6 Commit：原子提交，进入下一区块]
+  end
 
-    %% Post-conditions & invariants
-    Note over MB,VM: Same ordering & rules apply to<br/>Timer and Offchain entries
-    Note over TB: Timers created/updated/canceled in block h<br/>do NOT execute in h (isolation)
+  %% Edges (data/control flow)
+  E1 --> I1
+  E1 --> I2
+  I1 --> D1
+  I2 --> D1
+  D1 --> D2 --> D3 --> D4 --> S1 --> S2 --> M1 --> B1 --> C1 --> C2 --> C3
+  D4 -. 未入选 .-> M2
+
+  %% Optional: constraints summary (read-only info)
+  subgraph L8[约束（摘要）]
+    K1[确定性：禁止本地时钟/随机源；同一只读快照；稳定比较键]
+    K2[公平性：per-target RR + 全局/每目标配额，避免饥饿]
+    K3[幂等：deliver_id 保证 Materialize 不重复；reorg 可重演]
+    K4[范围：CIP-5 到“入箱”为止；执行/计费/提交见 CIP-6]
+  end
 
 ```
 
