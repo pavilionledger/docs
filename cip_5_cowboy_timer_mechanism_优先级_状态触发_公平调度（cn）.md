@@ -10,39 +10,38 @@
 
 ---
 ```mermaid
-flowchart TD
-  A[CIP-5 定位：仅到“入箱”，EOB 属于 CIP-6]:::note
+flowchart TB
+  A["CIP-5 定位：仅到“入箱”，EOB 属于 CIP-6"]
 
-  subgraph S1[索引（只读）]
-    H[IndexHeight（due_height -> timer_ids）]
-    W[IndexWatch（watch_pred -> timer_ids）]
-    X[无 IndexTime（禁止墙上时钟）]
+  subgraph S1["索引（只读）"]
+    H["IndexHeight：due_height → timer_ids"]
+    W["IndexWatch：watch_pred → timer_ids"]
+    X["无 IndexTime（禁止墙上时钟）"]
   end
 
-  subgraph S2[候选构造]
-    C1[从 Index* 取“到期/命中”的 timer（在区块 h）]
-    C2[构造候选集 C]
-    C3[计算 score := f(W_age, W_bid, W_fifo)]
+  subgraph S2["候选构造"]
+    C1["从 Index* 读取到期/命中的 timer（区块 h）"]
+    C2["构造候选集 C"]
+    C3["计算 score = f(Wage, Wbid, Wfifo)"]
   end
 
-  subgraph S3[公平选择与配额]
-    O1[比较器：score → per-target RR → FIFO（同分）]
-    Q1[MAX_FIRES_PER_BLOCK]
-    Q2[MAX_FIRES_PER_TARGET]
-    Q3[MIN_GAS_LIMIT_PER_TIMER]
-    N1[禁止浮点/随机；迭代顺序稳定]
+  subgraph S3["公平选择与配额"]
+    O1["比较器：score → per-target RR → FIFO（同分）"]
+    Q1["MAX_FIRES_PER_BLOCK"]
+    Q2["MAX_FIRES_PER_TARGET"]
+    Q3["MIN_GAS_LIMIT_PER_TIMER"]
+    N1["约束：禁止浮点/随机；迭代顺序稳定"]
   end
 
-  subgraph S4[物化到 Mailbox（到此为止）]
-    M1[为每个入选 timer 生成 MailboxEntry]
-    M2[deliver_id := H(h, parent_state_root, timer_id, fire_seq)]
-    M3[snapshot：payload / gas_limit / bid / trigger_ctx]
-    M4[source := Timer]
-    M5[结果：仅入箱；执行/结算/提交 → 见 CIP-6]
+  subgraph S4["物化到 Mailbox（到此为止）"]
+    M1["为每个入选 timer 生成 MailboxEntry"]
+    M2["deliver_id = H(h, parent_state_root, timer_id, fire_seq)"]
+    M3["snapshot：payload / gas_limit / bid / trigger_ctx"]
+    M4["source = Timer"]
+    M5["结果：仅入箱；执行/结算/提交 → 见 CIP-6"]
   end
 
   A --> S1 --> S2 --> S3 --> S4
-  classDef note fill:#f5f5f5,stroke:#bbb,color:#333;
 
 ```
 +------------------------------------------------------------------------------------------------------+
