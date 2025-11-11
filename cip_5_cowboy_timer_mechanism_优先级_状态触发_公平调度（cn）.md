@@ -10,65 +10,6 @@
 
 ---
 
-
-```mermaid
-flowchart LR
-  %% CIP-5 Timer Mechanism — Swimlane-style via subgraphs
-
-  subgraph L1[Execution]
-    E1[① 产生状态变更（可能触发 Watch 条件）<br/>※ 不使用本地时钟；以区块高度/状态为准]
-  end
-
-  subgraph L2[Timers.Index]
-    I1[② IndexHeight：登记/维护 due_height（周期性仅登记下一次）]
-    I2[② IndexWatch：登记满足状态条件的 Watch（match_set）]
-  end
-
-  subgraph L3[Timers.Deliver]
-    D1[③ 构造候选集：<br/>· IndexHeight 中 due_height ≤ h<br/>· IndexWatch 中在父状态满足条件]
-    D2[④ 计算候选优先级（priority）：<br/>priority_bucket、bid_snapshot、gas_limit_snapshot、trigger_ctx …<br/>※ 禁止使用 float/本地时间]
-    D3[⑤ 约束与公平性剪枝：<br/>· MAX_FIRES_PER_BLOCK / PER_TARGET<br/>· per-target RR（轮转）<br/>· MIN_GAS_LIMIT_PER_TIMER 等]
-    D4[⑥ 稳定排序（stable order）：<br/>priority_bucket → RR → FIFO（同桶）]
-  end
-
-  subgraph L4[Scheduler]
-    S1[⑦ 生成 deliver_id = H(h, parent_state_root, timer_id, fire_seq)]
-    S2[⑧ Materialize：产出 System message（source=Timer）]
-  end
-
-  subgraph L5[Messaging]
-    M1[⑨ Enqueue：将 System message 写入目标 Actor 的 MAILBOX]
-    M2[（未入选候选保留在索引侧，等待后续区块）]
-  end
-
-  subgraph L6[Mailbox]
-    B1[⑩ MailboxSegment 可见（尚未执行，仅完成确定性注入）]
-  end
-
-  subgraph L7["handoff to CIP-6 (EOB)"]
-    C1[⑪ EOB-3 ExecuteMailbox（按 CIP-6 比较器执行）]
-    C2[EOB-5 System hooks：批量写回周期 Timer 的下一次 due_height]
-    C3[EOB-6 Commit：原子提交，进入下一区块]
-  end
-
-  %% Edges (data/control flow)
-  E1 --> I1
-  E1 --> I2
-  I1 --> D1
-  I2 --> D1
-  D1 --> D2 --> D3 --> D4 --> S1 --> S2 --> M1 --> B1 --> C1 --> C2 --> C3
-  D4 -. 未入选 .-> M2
-
-  %% Optional: constraints summary (read-only info)
-  subgraph L8[约束（摘要）]
-    K1[确定性：禁止本地时钟/随机源；同一只读快照；稳定比较键]
-    K2[公平性：per-target RR + 全局/每目标配额，避免饥饿]
-    K3[幂等：deliver_id 保证 Materialize 不重复；reorg 可重演]
-    K4[范围：CIP-5 到“入箱”为止；执行/计费/提交见 CIP-6]
-  end
-
-```
-
 ## 1. 摘要（Abstract）
 
 本提案定义 Cowboy 协议中的 **原生 Timer 机制**：在不依赖外部 keeper 网络的前提下，为合约/Actor 提供**按区块高度**与**按状态变更**两类触发能力，并在**区块末（EOB）**以确定、可重演的方式筛选、物化并投递到各 Actor 的 **Mailbox**。
@@ -108,6 +49,7 @@ flowchart LR
 ## 4. 适用范围（In Scope）与非目标（Out of Scope）
 
 **In Scope**
+
 1. Timer 的链上状态模型与索引结构；
 2. 触发判定（高度 / 状态变更）、候选集构造；
 3. 排序与公平调度（老化、出价、FIFO、配额）；
@@ -116,6 +58,7 @@ flowchart LR
 6. 治理参数与实现参考（性能、分片）。
 
 **Out of Scope**
+
 - EOB 的全流程顺序与费用调整细节（见 **CIP-6: EOB Lifecycle**）。
 - Off-chain Runner 的证明与争议流程（见 **CIP-2**）。
 - 存储引擎的物理布局与提交流程（见 **CIP-4**）。
@@ -126,15 +69,66 @@ flowchart LR
 
 - **交易阶段（Tx）**：只进行 `set_timeout(due_height)`、`set_interval(every_blocks)`、`set_state_watch(keys)`、`cancel_timer(id)` 等**登记/更新/取消**；不执行回调。
 - **EOB 阶段（Deliver → Materialize → Execute）**：
-  1) **Deliver**：根据 `due_height ≤ h` 与 `watch_keys ∩ ModifiedKeySet(h) ≠ ∅` 生成候选；按全序排序与配额剪枝；
-  2) **Materialize**：把入选项物化为 Mailbox 条目，生成 `deliver_id`，快照 payload/gas/bid/trigger_ctx；
-  3) **Execute（见 CIP-6）**：在本块内按固定顺序执行 Mailbox 条目，产生回执与写集；周期计时器写回下一次 `due_height`。
+  1. **Deliver**：根据 `due_height ≤ h` 与 `watch_keys ∩ ModifiedKeySet(h) ≠ ∅` 生成候选；按全序排序与配额剪枝；
+  2. **Materialize**：把入选项物化为 Mailbox 条目，生成 `deliver_id`，快照 payload/gas/bid/trigger_ctx；
+  3. **Execute（见 CIP-6）**：在本块内按固定顺序执行 Mailbox 条目，产生回执与写集；周期计时器写回下一次 `due_height`。
+
+### 5.1 泳道图（Swimlane）
+
+> 下图概括了从“登记/更新/取消”到“EOB 甄选（Deliver）→ 入箱（Materialize）→ 执行（Execute）”的全流程。注意：当前块新建的 Timer 不会在同块被触发执行。
+
+```mermaid
+flowchart LR
+  %% 泳道：Owner/Client
+  subgraph L1["Owner / Client"]
+    A1["提交：set_timeout / set_interval / set_state_watch / cancel_timer"]
+  end
+
+  %% 泳道：协议（交易阶段：登记与索引）
+  subgraph L2["协议：交易阶段（登记与索引）"]
+    T1["校验并写入 TimerMeta（payload/gas/bid/...）"]
+    T2["更新索引：IndexHeight / IndexWatch"]
+    TL["记录本块 ModifiedKeySet(h)（来自交易执行日志）"]
+  end
+
+  %% 泳道：EOB Deliver
+  subgraph L3["EOB：Deliver（候选→排序→配额）"]
+    D0["开始 EOB(h, parent_state_root)"]
+    D1["候选①：IndexHeight.le(h)（高度触发 due_height ≤ h）"]
+    D2["候选②：IndexWatch[ModifiedKeySet(h)]（状态触发）"]
+    D3["去重：按 (target, timer_id) 去重；排除本块新建的 Timer"]
+    D4["评分与全序：score=W_age*age + W_bid*bid + W_fifo*fifo"]
+    D5["配额剪枝：全局 MAX_FIRES_PER_BLOCK + 每目标 MAX_FIRES_PER_TARGET；目标间 RR"]
+    D6["物化入箱：deliver_id = H(h, parent_state_root, timer_id, fire_seq)"]
+    D7["幂等：重复物化可识别并丢弃；fire_seq += 1"]
+  end
+
+  %% 泳道：Mailbox & Execute
+  subgraph L4["Mailbox & Execute（见 CIP-6）"]
+    M1["各目标 Mailbox 接收条目（payload/gas/bid/trigger_ctx 快照）"]
+    X1["固定顺序执行 Mailbox 条目（同块）"]
+    X2["周期计时器：执行后写回下一次 due_height = h + every_blocks"]
+    XR["失败出回执；不破坏幂等"]
+  end
+
+  %% 主流程连线
+  A1 --> T1 --> T2
+  T2 --> D0
+  TL --> D2
+  D0 --> D1
+  D1 --> D3
+  D2 --> D3
+  D3 --> D4 --> D5 --> D6 --> D7 --> M1 --> X1 --> X2
+  X2 --> T2
+  X1 --> XR
+```
 
 ---
 
 ## 6. 状态模型与索引（State & Indices）
 
 ### 6.1 Timer 元数据（逻辑结构）
+
 ```
 TimerMeta {
   owner: Address,
@@ -154,6 +148,7 @@ TimerMeta {
 ```
 
 ### 6.2 全局索引
+
 - **IndexHeight**：`BTree<(due_height, target, timer_id)> → TimerMetaRef`
 - **IndexWatch**：`Map<KeyPrefix, Set<(target, timer_id)>>`
 
@@ -164,15 +159,18 @@ TimerMeta {
 ## 7. API 规范（外部接口）
 
 ### 7.1 设置与取消
+
 - `set_timeout(target, due_height, payload, gas_limit, bid_fp?) -> timer_id`
 - `set_interval(target, every_blocks, payload, gas_limit, bid_fp?) -> timer_id`
 - `set_state_watch(target, watch_keys[], payload, gas_limit, bid_fp?) -> timer_id`
 - `cancel_timer(target, timer_id) -> bool`
 
 **错误码（示例）**
+
 - `ERR_INVALID_PARAM`、`ERR_TARGET_NOT_FOUND`、`ERR_TIMER_NOT_FOUND`、`ERR_QUOTA_EXCEEDED`、`ERR_UNSUPPORTED_TIMER_TYPE`（如传入时间参数）。
 
 ### 7.2 行为约束
+
 - **幂等设置**：同 `(owner, target, client_nonce)` 可选映射到稳定 `timer_id`；
 - **更新语义**：更新 `payload/gas_limit/bid` 会提升 `fifo_rank`（用于公平 FIFO）；
 - **取消语义**：在 EOB 入箱前取消，则当块不再入选；已物化入箱的条目不受影响（见执行阶段）。
@@ -182,10 +180,12 @@ TimerMeta {
 ## 8. Deliver：触发判定与候选集构造
 
 ### 8.1 判定规则
+
 - **高度触发**：`due_height ≤ h`。
 - **状态触发**：`watch_keys ∩ ModifiedKeySet(h) ≠ ∅`，其中 `ModifiedKeySet(h)` 为本块交易执行日志中的修改键集合；必须来源于链上确定可见的执行记录。
 
 ### 8.2 候选集合并与去重
+
 - 从 `IndexHeight.le(h)` 与 `IndexWatch[ModifiedKeySet(h)]` 取回集合，按 `(target,timer_id)` 去重；
 - 对于 `INTERVAL` 类型，`due_height` 为按 `every_blocks` 推导出的下一次高度；执行成功或按规则后滚动递增。
 
@@ -194,16 +194,20 @@ TimerMeta {
 ## 9. 排序、公平与限流（Scheduling & Fairness）
 
 ### 9.1 评分函数（定点整数）
+
 ```
 age_blocks = max(0, h - due_height)
 score = W_age * age_blocks + W_bid * bid_fp + W_fifo * fifo_rank
 ```
+
 - `W_*` 为治理参数；
 - 禁止使用浮点数与本地时间源；
 - 所有参与字段来自同一读快照（EOB 开始时）。
 
 ### 9.2 全序比较器（Total Order）
+
 从高到低：
+
 1. `score`（大在前）；
 2. `priority_bucket`（可选分层，派生自 bid 或管理员策略）；
 3. `per_target_round_robin_cursor`（目标间公平轮转，纯函数或链上状态推导）；
@@ -212,6 +216,7 @@ score = W_age * age_blocks + W_bid * bid_fp + W_fifo * fifo_rank
 6. `timer_id`（字典序/创建序）。
 
 ### 9.3 配额限流（Quota）
+
 - 全局：`MAX_FIRES_PER_BLOCK`；
 - 每目标：`MAX_FIRES_PER_TARGET`；
 - 算法：先全序排序，再以轮转方式按配额剪枝；未入选者保留在索引中，`age_blocks` 下块自然增大。
@@ -221,6 +226,7 @@ score = W_age * age_blocks + W_bid * bid_fp + W_fifo * fifo_rank
 ## 10. 物化入箱（Materialize to Mailbox）
 
 ### 10.1 Mailbox 条目结构
+
 ```
 MailboxEntry {
   deliver_id = H(h, parent_state_root, timer_id, fire_seq),
@@ -237,6 +243,7 @@ MailboxEntry {
 ```
 
 ### 10.2 幂等与去重
+
 - `deliver_id` 唯一；重复物化会被识别并丢弃；
 - `fire_seq` 每次物化后 +1；
 - 物化操作只读原有元数据，禁止在此阶段修改合约状态。
@@ -395,4 +402,3 @@ def deliver_timers(h, parent_state_root, modified_keys):
 ---
 
 > 本文档旨在成为**独立完整**的 Timer 规范：合约如何设置/取消，协议如何在 EOB 判定/排序/入箱，如何计费与限流，以及如何保证强确定性与可扩展性。EOB 的完整顺序与费用结算细节请参见配套的 **CIP-6**。
-
