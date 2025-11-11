@@ -12,86 +12,61 @@
 
 
 ```mermaid
-flowchart LR
-  %% Layout
-  %% Keep labels ASCII-only and use <br/> line breaks.
+sequenceDiagram
+    autonumber
+    participant EXE as Execution Engine
+    participant TIM as Timers (CIP-5)
+    participant EOB as EOB (control)
+    participant MBX as Messaging/Mailbox
+    participant VM  as VM (PyVM/EVM)
+    participant ST  as State/Fees/BlockMeta
 
-  %% 1) Execution Engine
-  subgraph A[Execution Engine]
-    TX[Tx @ h<br/>Produces ModifiedKeySet(h)<br/>Produces ExecutedTxLog(h)]
-  end
+    %% --- Pre-EOB: execute tx in block h ---
+    EXE->>EXE: Run TX @ height h
+    EXE->>EXE: Build ModifiedKeySet(h), ExecutedTxLog(h)
 
-  %% 2) Timers (CIP-5)
-  subgraph B[Timers (CIP-5)]
-    T0[Register/Update/Cancel<br/>(no firing in same block)]
-    T1[EOB-1 DeliverTimers<br/>Candidates = IndexHeight <= h<br/>& IndexWatch & ModifiedSet<br/>Dedup -> Score(age/bid/FIFO)<br/>Per-target RR + quotas<br/>Materialize to Mailbox<br/>deliver_id = H(h,parent_root,timer_id,seq)]
-    T5[EOB-5 SystemHooks<br/>Batch write next due_height<br/>for interval/periodic timers]
-  end
+    %% --- EOB-1: DeliverTimers (collect + order + materialize) ---
+    EXE->>EOB: Start EOB pipeline for block h
+    Note over EOB: EOB-1 DeliverTimers
+    EOB->>TIM: Call deliver() with h, parent_state_root,<br/>IndexHeight.le(h), IndexWatch ∩ ModifiedKeySet(h)
+    TIM->>TIM: Dedup -> Score(age/bid/FIFO) -> Per-target RR -> Quotas
+    TIM->>MBX: Materialize Timer entries (deliver_id = H(h,parent_root,timer_id,seq))
+    TIM-->>EOB: Candidate set materialized (Mailbox entries)
 
-  %% 3) EOB (control plane)
-  subgraph C[EOB (control plane, fixed order)]
-    E1[EOB-1 DeliverTimers<br/>call CIP-5 deliver()]
-    E2[EOB-2 ResolveOffchain<br/>Valid runner callbacks -> Mailbox]
-    E3[EOB-3 ExecuteMailbox<br/>Total order: phase->priority->RR->id<br/>Exec (failures billed)]
-    E4[EOB-4 Fees & Burn<br/>Aggregate Cycles/Cells<br/>Adjust basefees/settle]
-    E5[EOB-5 SystemHooks<br/>Archive/Index/VRF/Gov apply]
-    E6[EOB-6 Commit<br/>Atomic commit: STATE/RECEIPTS/<br/>MAILBOX(segment)/METERS/<br/>BLOCKMETA/state_root(h)]
-  end
+    %% --- EOB-2: Resolve offchain callbacks ---
+    Note over EOB: EOB-2 ResolveOffchain
+    EOB->>ST: Read runner inbox (<= h, verified, no dispute)
+    EOB->>MBX: Materialize Offchain entries (same ordering rules)
 
-  %% 4) Messaging / Mailbox
-  subgraph D[Messaging / Mailbox]
-    M1[Materialize MailboxEntry<br/>(from Timers)]
-    M2[Materialize MailboxEntry<br/>(from Offchain)]
-    M3[Maintain total order<br/>phase->priority->RR->deliver_id]
-    M6[Mailbox segment persisted]
-  end
+    %% --- EOB-3: Execute mailbox in total order ---
+    Note over EOB,MBX,VM: EOB-3 ExecuteMailbox
+    MBX->>MBX: Maintain total order: phase -> priority -> RR -> deliver_id
+    MBX->>VM: Dispatch next mailbox entry
+    VM->>ST: Apply writes (STATE/RECEIPTS/METERS/LOGS)
+    loop Until mailbox empty
+        MBX->>VM: Next entry (failures billed too)
+        VM->>ST: Write effects
+    end
 
-  %% 5) VM
-  subgraph E[VM (PyVM/EVM)]
-    V3[Run mailbox entries<br/>Schedule target actor<br/>Write state]
-  end
+    %% --- EOB-4: Fees & Burn ---
+    Note over EOB,ST: EOB-4 Fees & Burn
+    EOB->>ST: Aggregate Cycles/Cells, adjust basefees, burn, tips
 
-  %% 6) State / Fees / BlockMeta
-  subgraph F[State / Fees / BlockMeta]
-    S1[Read-only indexes for EOB-1]
-    S2[Read-only runner inbox for EOB-2]
-    S3[Writes: STATE changes,<br/>RECEIPTS/METERS/LOGS]
-    S4[Usage aggregation & settlement<br/>Basefee adjust & burn/tips]
-    S5[Batch system writes<br/>(next due_height for intervals)]
-    S6[Commit & compute state_root(h)]
-  end
+    %% --- EOB-5: System hooks & periodic timer roll-forward ---
+    Note over EOB,TIM,ST: EOB-5 SystemHooks
+    EOB->>TIM: Batch write next due_height for interval/periodic timers
+    EOB->>ST: Archive/Index/VRF/Gov apply (system-level)
 
-  %% Cross-lane flows
-  TX --> T0
-  TX --> E1
+    %% --- EOB-6: Atomic commit ---
+    Note over EOB,ST,MBX: EOB-6 Commit
+    EOB->>ST: Commit STATE/RECEIPTS/METERS/BLOCKMETA, compute state_root(h)
+    EOB->>MBX: Persist mailbox segment for h
 
-  %% EOB-1: timers -> mailbox
-  E1 --> T1 --> M1
+    %% --- In-Block constraints / invariants ---
+    Note over TIM: New/updated/cancelled timers created in this block<br/>do NOT fire in the same block
+    Note over MBX: Materialization is idempotent via deliver_id
+    Note over EXE,ST: Deterministic inputs only (no local time/random)
 
-  %% EOB-2: offchain -> mailbox
-  E2 --> M2
-
-  %% Merge and order before execute
-  M1 --> M3
-  M2 --> M3
-
-  %% EOB-3 execute
-  M3 --> E3 --> V3 --> S3
-
-  %% EOB-4 fees
-  E4 --> S4
-
-  %% EOB-5 hooks
-  E5 --> T5
-  E5 --> S5
-
-  %% EOB-6 commit
-  E6 --> M6
-  E6 --> S6
-
-  %% Read-only cues (dotted)
-  S1 -. read-only .-> E1
-  S2 -. read-only .-> E2
 ```
 
 ## 1. 摘要（Abstract）
