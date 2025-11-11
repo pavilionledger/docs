@@ -11,41 +11,133 @@
 ---
 
 
-时间 →  ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────>
-阶段 →      [Tx 执行@h]            EOB-1 DeliverTimers         EOB-2 ResolveOffchain       EOB-3 ExecuteMailbox     EOB-4 Fees&Burn    EOB-5 SystemHooks     EOB-6 Commit
-           ─────────────────      ─────────────────────────    ─────────────────────────    ───────────────────────   ────────────────   ───────────────────    ────────────────
+```mermaid
+flowchart LR
+  %% 布局从左到右
+  %% 说明：节点文字尽量精简；保持与文档一致（EOB-1..6，Timer 判定/物化/执行）
+  
+  %% ─────────────────────────────
+  %% 1) Execution Engine
+  %% ─────────────────────────────
+  subgraph A[Execution Engine]
+    TX[Tx 执行 @h
+→ 生成 ModifiedKeySet(h)
+→ 生成 ExecutedTxLog(h)]
+  end
 
-Execution   | 执行本块 TX，形成       |                          |                           |                          |                  |                      |
-Engine      | ModifiedKeySet(h)/    |                          |                           |                          |                  |                      |
-            | ExecutedTxLog(h)      |                          |                           |                          |                  |                      |
-           ─────────────────────────┴──────────────────────────┴───────────────────────────┴──────────────────────────┴──────────────────┴──────────────────────┴────────────────
+  %% ─────────────────────────────
+  %% 2) Timers (CIP-5)
+  %% ─────────────────────────────
+  subgraph B[Timers（CIP-5）]
+    T0[登记/更新/取消
+（本块不执行）]
+    T1[EOB-1 DeliverTimers（判定+排序）
+候选=IndexHeight.le(h) ∪ (IndexWatch ∩ ModifiedSet)
+去重→评分(老化/出价/FIFO)
+per-target 轮转+配额剪枝
+Materialize→Mailbox
+deliver_id=H(h,parent_root,timer_id,seq)]
+    T5[EOB-5 SystemHooks（批量写回）
+周期/间隔型 Timer 下一次 due_height]
+  end
 
-Timers      | 仅登记/更新/取消        | 收集候选：                |                           | （等待执行阶段）          |                  | 批量写回周期/间隔型    | 状态随提交落盘
-(CIP-5)     | (本块不触发执行)       |  - IndexHeight.le(h)      |                           |                          |                  | Timer 下一次 due_height |
-            |                        |  - IndexWatch∩ModifiedSet |                           |                          |                  | （禁止在用户态修改）     |
-            |                        | 去重→评分(老化/出价/FIFO)→|                           |                          |                  |                      |
-            |                        | per-target 轮转+配额剪枝→ |                           |                          |                  |                      |
-            |                        | 物化入箱(Deliver→Materialize) |                        |                          |                  |                      |
-           ─────────────────────────┬──────────────────────────┬───────────────────────────┬──────────────────────────┬──────────────────┬──────────────────────┬────────────────
+  %% ─────────────────────────────
+  %% 3) EOB（控制面）
+  %% ─────────────────────────────
+  subgraph C[EOB（控制面，固定顺序）]
+    E1[EOB-1 DeliverTimers
+调用 CIP-5 deliver()]
+    E2[EOB-2 ResolveOffchain
+合规 Runner 回调→Mailbox]
+    E3[EOB-3 ExecuteMailbox
+全序：phase→priority→RR→id
+执行（失败亦计费）]
+    E4[EOB-4 Fees & Burn
+聚合 Cycles/Cells
+调整双基费/结算]
+    E5[EOB-5 SystemHooks
+归档/索引/VRF/治理生效]
+    E6[EOB-6 Commit
+原子提交：STATE/RECEIPTS/
+MAILBOX(segment)/METERS/
+BLOCKMETA/state_root(h)]
+  end
 
-EOB         | 启动区块末流水线        | 【EOB-1】调用 Deliver     | 【EOB-2】验证合规的        | 【EOB-3】按全序比较器     | 【EOB-4】聚合用量、 | 【EOB-5】系统钩子：     | 【EOB-6】原子提交：
-(控制面)    | （不可改顺序）          | 纯函数：将候选→Mailbox    | Runner 回调→Mailbox        | 执行 Mailbox（含失败计费）| 调整双基费+燃烧+小费 | 归档/索引/VRF/治理生效  | STATE / RECEIPTS /
-            |                        | （幂等 deliver_id）        | （与 Timer 共用规则）      | 生成日志与写集             |                    | + 批量写回周期 Timer     | MAILBOX(segment) /
-            |                        |                          |                           |                          |                    | 下一次 due_height        | METERS / BLOCKMETA /
-            |                        |                          |                           |                          |                    |                          | state_root(h)
-           ─────────────────────────┼──────────────────────────┼───────────────────────────┼──────────────────────────┼──────────────────┼──────────────────────┼────────────────
+  %% ─────────────────────────────
+  %% 4) Messaging / Mailbox
+  %% ─────────────────────────────
+  subgraph D[Messaging / Mailbox]
+    M1[物化 MailboxEntry
+（来自 Timers）]
+    M2[物化 MailboxEntry
+（来自 Offchain）]
+    M3[维持全序
+phase→priority→RR→deliver_id]
+    M6[Mailbox 段持久化]
+  end
 
-Messaging/  | （空）                 | 物化 MailboxEntry：        | 物化 MailboxEntry：        | 维持全序：                 | （空）             | （如需索引维护）         | Mailbox 段随提交持久化
-Mailbox     |                        |  deliver_id=H(h,...)      |  offchain 回调条目         | phase→priority→RR→id      |                    |                          |（入箱幂等）
-           ─────────────────────────┼──────────────────────────┼───────────────────────────┼──────────────────────────┼──────────────────┼──────────────────────┼────────────────
+  %% ─────────────────────────────
+  %% 5) VM（PyVM/EVM）
+  %% ─────────────────────────────
+  subgraph E[VM（PyVM/EVM）]
+    V3[执行入箱条目
+调度 target actor
+写回状态]
+  end
 
-VM          | （空）                 | （空）                     | （空）                     | 执行入箱条目（PyVM/EVM）：  | （空）             | （空）                   | （空）
-(PyVM/EVM)  |                        |                           |                           | 调度 target actor→写回状态 |                    |                          |
-           ─────────────────────────┼──────────────────────────┼───────────────────────────┼──────────────────────────┼──────────────────┼──────────────────────┼────────────────
+  %% ─────────────────────────────
+  %% 6) State / Fees / BlockMeta
+  %% ─────────────────────────────
+  subgraph F[State / Fees / BlockMeta]
+    S1[只读索引用于判定
+（不改状态）]
+    S2[只读 RunnerInbox 判定
+（不改状态）]
+    S3[写集：STATE 变更/
+RECEIPTS/METERS/LOGS]
+    S4[聚合用量与结算
+基费调整与燃烧/小费]
+    S5[批量系统级写
+（周期 Timer 下一次 due_height）]
+    S6[提交并计算
+state_root(h)]
+  end
 
-State/Fees/ | （生成 ModifiedKeySet）| （只读索引用于判定）        | （只读 RunnerInbox 判定）   | 产生写集（STATE 变更、     | 聚合 Cycles/Cells | 批量系统级写（含周期     | 原子落盘并计算
-BlockMeta   |                        | 不改状态                   | 不改状态                   | RECEIPTS/METERS/LOGS）     | 基费调整与结算    | Timer 下一次 due_height）| state_root(h)
-           ─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  %% ─────────────────────────────
+  %% 阶段内外数据流（跨泳道连线）
+  %% ─────────────────────────────
+  TX --> T0
+  TX --> E1
+
+  %% EOB-1：从 Timers 判定并物化至 Mailbox
+  E1 --> T1 --> M1
+
+  %% EOB-2：合规的 Offchain 回调物化至 Mailbox
+  E2 --> M2
+
+  %% 执行前总序维护
+  M1 --> M3
+  M2 --> M3
+
+  %% EOB-3：执行入箱条目
+  M3 --> E3 --> V3 --> S3
+
+  %% EOB-4：费用与基费
+  E4 --> S4
+
+  %% EOB-5：系统钩子与周期 Timer 写回
+  E5 --> T5
+  E5 --> S5
+
+  %% EOB-6：原子提交（Mailbox 段与状态）
+  E6 --> M6
+  E6 --> S6
+
+  %% 辅助虚线：判定期仅读
+  S1 -. 只读 .-> E1
+  S2 -. 只读 .-> E2
+
+```
 
 ## 1. 摘要（Abstract）
 
